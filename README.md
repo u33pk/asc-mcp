@@ -1,13 +1,103 @@
-# Droid ASC: R8 Compiler Optimization as a DeCompiler Primitive
-https://blackhat.com/europe/arsenal/schedule/index.html#droid-asc-r8-compiler-optimization-as-a-decompiler-primitive-54834  
+# ASC MCP Server
 
-When decompiling massive Android APKs, the standard procedure is to wait. We wait for tools to eat gigabytes of RAM, fully inflate the artifacts, and spend tens of minutes building heavy global indexes and cross references... All of this is just to guarantee fast code searches later, but here is the contradiction. A compiled artifact is already highly structured, modern decompilers never utilize this, they waste massive amounts of time and memory reconstructing a bloated database of code relationships over already structured data. This engineering approach defies common sense. When I can directly extract any code relationship from the APK in milliseconds, does this preprocessing still hold any value?  
+High-performance Android APK reverse engineering MCP server, powered by [Droid ASC](https://github.com/MG1937/ASC) core engine.
 
-Instead of forcing decompilers into heavy preprocessing, we choose to query the compiled artifact directly as a database. We built a stateless, zero-overhead engine that extracts and searches code on demand in milliseconds. In this briefing, we will explore the underlying engineering required to bypass traditional bottlenecks. We will demonstrate how to abandon full inflate by probing directly within the Deflate bitstream, building dense Huffman lookup tables to extract core metadata without touching irrelevant data blocks. Furthermore, we will explain optimization details of the R8 compiler, especially how deterministic constant relocation and instruction deduplication leave behind highly concentrated physical layouts, we weaponize this compiler behavior to execute lightning-fast cross DEX code searches. To map these raw bytecode offsets back to methods, we engineered an O(1) instruction locating primitive, achieving constant-time method resolution without building heavy mapping tables. Finally, upon hitting a target, Droid ASC extracts only the specific bytecodes and its dependencies, dynamically reconstructing a minimal and self consistent DEX entirely in memory for instant decompilation.  
+Operates directly on compiled APK/DEX artifacts as a read-only database — no full inflate, no heavy preprocessing. Global cross-reference searches in ~1.8s, class decompilation in ~177ms, using only ~141MB of RAM even against 352MB commercial APKs.
 
-We will demonstrate this architecture live against a 352MB commercial APK. Droid ASC executes global cross reference searches in 1.79 seconds and decompiles target classes in 177 milliseconds using only 141MB of RAM. By treating the artifact as a read only database and operating with zero preprocessing, we return the decompiler to its core essence. It is no longer a bloated indexing tool, but a lightning fast, on demand decompilation engine that fundamentally redefines how we analyze compiled code.  
+## Quick Start
 
-# Benchmark
-![Benchmark](./docs/benchmark_all_en.png)
-[ASC_Benchmark.mp4](https://github.com/MG1937/ASC/blob/main/docs/ASC_Benchmark.mp4)
+```bash
+# Install dependencies into .venv
+uv sync
 
+# Run MCP server (stdio transport)
+uv run run_mcp.py
+```
+
+Configure in any MCP-compatible client (e.g. Claude Desktop, Kimi Code):
+
+```json
+{
+  "mcpServers": {
+    "asc": {
+      "command": "uv",
+      "args": ["run", "/path/to/ASC/run_mcp.py"]
+    }
+  }
+}
+```
+
+## Tools (13)
+
+### Core Analysis
+
+| Tool | Description |
+|------|-------------|
+| `apk_get_manifest` | Extract AndroidManifest.xml (structured summary or raw XML) |
+| `apk_list_classes` | List/filter class names across all DEX files |
+| `apk_get_class_outline` | Structural skeleton of a class (fields, method signatures, no bodies) |
+| `apk_get_class_source` | Full on-demand Java decompilation of a single class |
+| `apk_disassemble_method` | Disassemble a single method into smali bytecode |
+
+### Search & Reference
+
+| Tool | Description |
+|------|-------------|
+| `apk_find_references` | Global cross-reference search (string/type/method/field usages) |
+| `apk_list_methods` | Search methods by name across all DEX files (fuzzy match) |
+| `apk_search_strings` | Global regex search in the DEX string pool |
+| `apk_get_string_constants` | Extract all `const-string` values from a specific class |
+
+### Security Scanning
+
+| Tool | Description |
+|------|-------------|
+| `apk_scan_secrets` | Scan for hardcoded secrets with 16 built-in patterns (AWS keys, JWT, private keys, passwords, etc.) |
+
+### APK Structure
+
+| Tool | Description |
+|------|-------------|
+| `apk_list_resources` | List resource files with category breakdown (res/, assets/, lib/) |
+| `apk_list_native_libs` | List .so files by architecture (arm64-v8a, armeabi-v7a, etc.) |
+| `apk_extract_dex` | Export DEX files to disk for external tools (JADX, Ghidra, IDA) |
+
+## Architecture
+
+```
+MCP Client (LLM)
+    │  stdio JSON-RPC
+    ▼
+┌─────────────────────┐
+│  server.py          │  Tool definitions & dispatch
+└────────┬────────────┘
+         │  subprocess JSON IPC
+         ▼
+┌─────────────────────┐
+│  worker.py          │  Isolated worker process
+├─────────────────────┤
+│  asc_client/        │  APK I/O, decompilation
+│  asc_core/          │  DEX parsing, bytecode engine
+│  smali_renderer.py  │  Smali disassembly
+└─────────────────────┘
+```
+
+Worker subprocess isolation is required because the decompiler aggressively monkey-patches `sys.modules`.
+
+## CLI Usage
+
+```bash
+# Decompile a class
+python main.py getclass app.apk Lcom/example/MyClass; -o output.java
+
+# Cross-reference search
+python main.py findrefs app.apk string "token"
+python main.py findrefs app.apk method onCreate --class com.example.MyClass
+
+# GUI
+python main.py app.apk --gui
+```
+
+## Credits
+
+Core engine by [MG1937](https://github.com/MG1937) — presented at Black Hat Europe Arsenal. See [ASC.md](./ASC.md) for the original project description and benchmarks.
