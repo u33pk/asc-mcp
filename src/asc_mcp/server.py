@@ -359,7 +359,7 @@ def apk_get_string_constants(
 @server.tool()
 def apk_scan_secrets(
     apk_path: str,
-    patterns: Optional[list[str]] = None,
+    patterns: list[str] = [],
     limit: int = 100,
 ) -> dict:
     """Scan the entire DEX string pool for hardcoded secrets and sensitive patterns.
@@ -369,8 +369,8 @@ def apk_scan_secrets(
 
     Args:
         apk_path: Path to the target APK file.
-        patterns: Optional list of pattern names to run (e.g. ['aws_access_key', 'jwt_token']).
-                  If omitted, all built-in patterns are checked.
+        patterns: List of pattern names to run (e.g. ['aws_access_key', 'jwt_token']).
+                  If empty (default), all built-in patterns are checked.
         limit: Maximum number of findings to return (1-500, default 100).
     """
     try:
