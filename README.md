@@ -27,7 +27,7 @@ Configure in any MCP-compatible client (e.g. Claude Desktop, Kimi Code):
 }
 ```
 
-## Tools (13)
+## Tools (16)
 
 ### Core Analysis
 
@@ -38,6 +38,7 @@ Configure in any MCP-compatible client (e.g. Claude Desktop, Kimi Code):
 | `apk_get_class_outline` | Structural skeleton of a class (fields, method signatures, no bodies) |
 | `apk_get_class_source` | Full on-demand Java decompilation of a single class |
 | `apk_disassemble_method` | Disassemble a single method into smali bytecode |
+| `apk_call_graph` | Caller/callee call graph for a method (configurable depth 1-5) |
 
 ### Search & Reference
 
@@ -48,11 +49,12 @@ Configure in any MCP-compatible client (e.g. Claude Desktop, Kimi Code):
 | `apk_search_strings` | Global regex search in the DEX string pool |
 | `apk_get_string_constants` | Extract all `const-string` values from a specific class |
 
-### Security Scanning
+### Security & Signing
 
 | Tool | Description |
 |------|-------------|
 | `apk_scan_secrets` | Scan for hardcoded secrets with 16 built-in patterns (AWS keys, JWT, private keys, passwords, etc.) |
+| `apk_get_certificate` | Extract signing certificate (issuer, fingerprints, algorithm, validity) |
 
 ### APK Structure
 
@@ -61,6 +63,12 @@ Configure in any MCP-compatible client (e.g. Claude Desktop, Kimi Code):
 | `apk_list_resources` | List resource files with category breakdown (res/, assets/, lib/) |
 | `apk_list_native_libs` | List .so files by architecture (arm64-v8a, armeabi-v7a, etc.) |
 | `apk_extract_dex` | Export DEX files to disk for external tools (JADX, Ghidra, IDA) |
+
+### Version Comparison
+
+| Tool | Description |
+|------|-------------|
+| `apk_diff` | Compare two APK versions — added/removed classes, method diffs, bytecode-level smali diff |
 
 ## Architecture
 
