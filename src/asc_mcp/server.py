@@ -1,5 +1,5 @@
 """ASC (Droid ASC) Model Context Protocol (MCP) Server.
-Exposes 13 high-performance, token-efficient reverse engineering tools to LLMs.
+Exposes 16 high-performance, token-efficient reverse engineering tools to LLMs.
 """
 
 import json
@@ -411,6 +411,97 @@ def apk_disassemble_method(
         )
     except Exception as e:
         return {"status": "error", "error": str(e), "apk_path": apk_path, "class_name": class_name, "method_name": method_name}
+
+
+@server.tool()
+def apk_get_certificate(
+    apk_path: str,
+) -> dict:
+    """Extract signing certificate information from an APK (V1 JAR signing).
+    Returns issuer, subject, serial number, validity period, signature algorithm,
+    public key info, and SHA256/SHA1 fingerprints. Essential for verifying if an APK
+    is an official release or has been repackaged.
+
+    Args:
+        apk_path: Path to the target APK file.
+    """
+    try:
+        return _invoke_worker("get_certificate", {"apk_path": apk_path})
+    except Exception as e:
+        return {"status": "error", "error": str(e), "apk_path": apk_path}
+
+
+@server.tool()
+def apk_call_graph(
+    apk_path: str,
+    class_name: str,
+    method_name: str,
+    method_signature: Optional[str] = None,
+    direction: str = "both",
+    depth: int = 1,
+) -> dict:
+    """Get the call graph for a method — who calls it (callers) and what it calls (callees).
+    Traces function call relationships to analyze data flow and understand code structure.
+
+    Args:
+        apk_path: Path to the target APK file.
+        class_name: Class name in dot or Dalvik format.
+        method_name: Method name (e.g. 'encrypt', 'onCreate').
+        method_signature: Optional signature fragment to disambiguate overloaded methods.
+        direction: 'callers' (who calls this), 'callees' (what this calls), or 'both' (default).
+        depth: Traversal depth 1-5 (default 1). Higher depth follows the call chain deeper.
+    """
+    try:
+        return _invoke_worker(
+            "call_graph",
+            {
+                "apk_path": apk_path,
+                "class_name": class_name,
+                "method_name": method_name,
+                "method_signature": method_signature,
+                "direction": direction,
+                "depth": depth,
+            },
+        )
+    except Exception as e:
+        return {"status": "error", "error": str(e), "apk_path": apk_path, "class_name": class_name, "method_name": method_name}
+
+
+@server.tool()
+def apk_diff(
+    old_apk: str,
+    new_apk: str,
+    level: int = 2,
+    package_prefix: str = "",
+    limit: int = 50,
+) -> dict:
+    """Compare two APK versions and report differences in classes and methods.
+    Supports three diff levels:
+      1 = class list only (added/removed classes)
+      2 = method list per class (added/removed methods)
+      3 = bytecode diff with smali output for modified methods
+    Essential for version comparison and security audit.
+
+    Args:
+        old_apk: Path to the older/base APK file.
+        new_apk: Path to the newer/target APK file.
+        level: Diff depth 1-3 (default 2).
+        package_prefix: Optional package prefix filter (e.g. 'com.example.app').
+        limit: Maximum number of changed classes/methods to return (1-200, default 50).
+    """
+    try:
+        return _invoke_worker(
+            "apk_diff",
+            {
+                "old_apk": old_apk,
+                "new_apk": new_apk,
+                "level": level,
+                "package_prefix": package_prefix,
+                "limit": limit,
+            },
+        )
+    except Exception as e:
+        return {"status": "error", "error": str(e), "old_apk": old_apk, "new_apk": new_apk}
 
 
 def main():

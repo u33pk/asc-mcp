@@ -957,6 +957,426 @@ def handle_disassemble_method(payload: dict) -> dict:
     }
 
 
+def handle_get_certificate(payload: dict) -> dict:
+    import zipfile
+    from asn1crypto import cms
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes
+
+    apk_path = payload["apk_path"]
+    if not os.path.isfile(apk_path):
+        raise FileNotFoundError(f"APK file not found: {apk_path}")
+
+    sig_entry = None
+    sig_data = None
+    with zipfile.ZipFile(apk_path, "r") as zf:
+        for name in zf.namelist():
+            upper = name.upper()
+            if upper.startswith("META-INF/") and (
+                upper.endswith(".RSA") or upper.endswith(".DSA") or upper.endswith(".EC")
+            ):
+                sig_data = zf.read(name)
+                sig_entry = name
+                break
+
+    if sig_data is None:
+        raise ValueError("No V1 signing certificate found (META-INF/*.RSA/*.DSA/*.EC)")
+
+    content_info = cms.ContentInfo.load(sig_data)
+    signed_data = content_info["content"]
+    certs = signed_data["certificates"]
+
+    results = []
+    for cert_choice in certs:
+        cert_der = cert_choice.dump()
+        cert = x509.load_der_x509_certificate(cert_der)
+
+        key = cert.public_key()
+        key_type = type(key).__name__
+        key_size = getattr(key, "key_size", 0)
+
+        sig_alg = cert.signature_algorithm_oid._name
+        if not sig_alg or sig_alg.startswith("Unknown"):
+            sig_alg = cert.signature_algorithm_oid.dotted_string
+
+        results.append({
+            "subject": cert.subject.rfc4514_string(),
+            "issuer": cert.issuer.rfc4514_string(),
+            "serial_number": str(cert.serial_number),
+            "not_valid_before": cert.not_valid_before_utc.isoformat(),
+            "not_valid_after": cert.not_valid_after_utc.isoformat(),
+            "signature_algorithm": sig_alg,
+            "public_key_type": key_type,
+            "public_key_size": key_size,
+            "fingerprint_sha256": cert.fingerprint(hashes.SHA256()).hex(":"),
+            "fingerprint_sha1": cert.fingerprint(hashes.SHA1()).hex(":"),
+        })
+
+    return {
+        "apk_path": apk_path,
+        "signature_entry": sig_entry,
+        "certificate_count": len(results),
+        "certificates": results,
+    }
+
+
+def _format_method_sig(method, dex) -> str:
+    proto = method.prototype
+    params = ",".join(t.descriptor for t in proto.parameters_type)
+    ret = dex.get_type(proto.return_type_idx).descriptor
+    return f"{method.name}({params}){ret}"
+
+
+def handle_call_graph(payload: dict) -> dict:
+    import mmap as mmap_mod
+    from src.asc_client.apk_handler import ApkHandler, _parse_cd_dex_entries, _inflate_dex
+    from src.asc_client.dex_container import iter_logical_dex_buffers
+    from src.asc_core.utils.tinydex import DEX
+    from src.asc_core.findrefs.findrefs_manager import FindRefManager
+    from models.dvm_opcode import opcodes as _opcodes, IndexFlag
+
+    apk_path = payload["apk_path"]
+    class_name = payload["class_name"]
+    method_name = (payload.get("method_name") or "").strip()
+    method_signature = (payload.get("method_signature") or "").strip()
+    direction = payload.get("direction", "both")
+    depth = max(1, min(int(payload.get("depth", 1)), 5))
+    dalvik_class = _format_class_name(class_name)
+
+    if not os.path.isfile(apk_path):
+        raise FileNotFoundError(f"APK file not found: {apk_path}")
+    if not method_name:
+        raise ValueError("'method_name' must be provided.")
+    if direction not in ("callers", "callees", "both"):
+        raise ValueError("direction must be one of: callers, callees, both")
+
+    # Locate target method
+    handler = ApkHandler(apk_path)
+    hit = handler.get_class_dex(dalvik_class)
+    if hit is None:
+        raise ValueError(f"Class {dalvik_class} not found in APK: {apk_path}")
+
+    dex_name, dex_buf = hit
+    dex = DEX.parse(memoryview(dex_buf), dex_name)
+    clazz = dex.get_class(dalvik_class)
+    if clazz is None:
+        raise ValueError(f"Failed to resolve class {dalvik_class}")
+
+    target_method = None
+    for m in clazz.methods:
+        if m.name != method_name:
+            continue
+        if method_signature:
+            sig = _format_method_sig(m, dex)
+            if method_signature not in sig:
+                continue
+        target_method = m
+        break
+
+    if target_method is None:
+        available = list({m.name for m in clazz.methods})
+        raise ValueError(f"Method '{method_name}' not found. Available: {available}")
+
+    target_sig = _format_method_sig(target_method, dex)
+    target_info = {
+        "class": _dalvik_to_dot(dalvik_class),
+        "method": method_name,
+        "signature": target_sig,
+    }
+
+    def get_callees(d, method):
+        callees = []
+        bc = method.bytecode
+        if not bc:
+            return callees
+        bc_len = len(bc)
+        seen = set()
+        pc = 0
+        while pc < bc_len:
+            opcode = bc[pc]
+            if opcode not in _opcodes:
+                break
+            op = _opcodes[opcode]
+            if op.idx in (IndexFlag.kIndexMethodRef, IndexFlag.kIndexMethodAndProtoRef):
+                idx = bc[pc + 2] | (bc[pc + 3] << 8)
+                if idx not in seen:
+                    seen.add(idx)
+                    try:
+                        callee = d.methods[idx]
+                        callees.append({
+                            "class": _dalvik_to_dot(callee.cls.fullname),
+                            "method": callee.name,
+                            "signature": _format_method_sig(callee, d),
+                            "invoke_type": op.name,
+                        })
+                    except (IndexError, KeyError):
+                        pass
+            pc += op.oplen * 2
+        return callees
+
+    def get_callers_single_dex(d, d_buf, d_name):
+        m = FindRefManager(d)
+        loc = m._get_method_locator(True)
+        mids = loc.locate({"class": [dalvik_class, True], "method": method_name})
+        if not mids:
+            return []
+        find = {"method": set(mids)}
+        m._get_code_scanner().scan(find)
+        caller_mids = set(x for x in find["method"] if x is not None)
+        results = []
+        for cmid in sorted(caller_mids):
+            cm = d.methods[cmid]
+            results.append({
+                "class": _dalvik_to_dot(cm.cls.fullname),
+                "method": cm.name,
+                "signature": _format_method_sig(cm, d),
+                "invoke_type": "",
+            })
+        return results
+
+    def get_callers_all():
+        callers = []
+        seen_classes = set()
+        with open(apk_path, "rb") as fp:
+            with mmap_mod.mmap(fp.fileno(), 0, access=mmap_mod.ACCESS_READ) as mm:
+                entries = _parse_cd_dex_entries(mm)
+                for entry in entries:
+                    data = _inflate_dex(mm, entry)
+                    if data is None:
+                        continue
+                    for d_name, d_buf in iter_logical_dex_buffers(entry[0], data):
+                        d = DEX.parse(memoryview(d_buf), d_name)
+                        for c in get_callers_single_dex(d, d_buf, d_name):
+                            key = (c["class"], c["method"], c["signature"])
+                            if key not in seen_classes:
+                                seen_classes.add(key)
+                                callers.append(c)
+        return callers
+
+    callers = []
+    callees = []
+
+    if direction in ("callers", "both"):
+        callers = get_callers_all()
+    if direction in ("callees", "both"):
+        callees = get_callees(dex, target_method)
+
+    return {
+        "apk_path": apk_path,
+        "target": target_info,
+        "depth": depth,
+        "direction": direction,
+        "callers_count": len(callers),
+        "callees_count": len(callees),
+        "callers": callers,
+        "callees": callees,
+    }
+
+
+def _collect_all_methods(apk_path: str) -> dict:
+    import mmap as mmap_mod
+    from src.asc_client.apk_handler import _parse_cd_dex_entries, _inflate_dex
+    from src.asc_client.dex_container import iter_logical_dex_buffers
+    from src.asc_core.utils.tinydex import DEX
+
+    result = {}
+    with open(apk_path, "rb") as fp:
+        with mmap_mod.mmap(fp.fileno(), 0, access=mmap_mod.ACCESS_READ) as mm:
+            entries = _parse_cd_dex_entries(mm)
+            for entry in entries:
+                data = _inflate_dex(mm, entry)
+                if data is None:
+                    continue
+                for dex_name, dex_buf in iter_logical_dex_buffers(entry[0], data):
+                    dex = DEX.parse(memoryview(dex_buf), dex_name)
+                    for i in range(len(dex.classes)):
+                        clazz = dex.classes[i]
+                        cls_name = clazz.fullname
+                        sigs = set()
+                        for m in clazz.methods:
+                            sigs.add(_format_method_sig(m, dex))
+                        result.setdefault(cls_name, set()).update(sigs)
+    return result
+
+
+def handle_apk_diff(payload: dict) -> dict:
+    import hashlib
+    import difflib
+    import mmap as mmap_mod
+    from src.asc_client.apk_handler import ApkHandler, _parse_cd_dex_entries, _inflate_dex
+    from src.asc_client.dex_container import iter_logical_dex_buffers
+    from src.asc_core.utils.tinydex import DEX
+    from src.asc_core.utils.smali_renderer import render_smali
+
+    old_apk = payload["old_apk"]
+    new_apk = payload["new_apk"]
+    level = max(1, min(int(payload.get("level", 2)), 3))
+    prefix = (payload.get("package_prefix") or "").strip()
+    limit = max(1, min(int(payload.get("limit", 50)), 200))
+
+    for p in (old_apk, new_apk):
+        if not os.path.isfile(p):
+            raise FileNotFoundError(f"APK file not found: {p}")
+
+    # --- collect class sets ---
+    def collect_classes(apk_path):
+        classes = set()
+        with open(apk_path, "rb") as fp:
+            with mmap_mod.mmap(fp.fileno(), 0, access=mmap_mod.ACCESS_READ) as mm:
+                for entry in _parse_cd_dex_entries(mm):
+                    data = _inflate_dex(mm, entry)
+                    if data is None:
+                        continue
+                    for dex_name, dex_buf in iter_logical_dex_buffers(entry[0], data):
+                        dex = DEX.parse(memoryview(dex_buf), dex_name)
+                        for i in range(len(dex.classes)):
+                            classes.add(dex.classes[i].fullname)
+        return classes
+
+    old_classes = collect_classes(old_apk)
+    new_classes = collect_classes(new_apk)
+
+    if prefix:
+        dot_prefix = prefix.replace(".", "/")
+        l_prefix = f"L{dot_prefix}" if not dot_prefix.startswith("L") else dot_prefix
+        old_classes = {c for c in old_classes if c.startswith(l_prefix)}
+        new_classes = {c for c in new_classes if c.startswith(l_prefix)}
+
+    added_classes = sorted(new_classes - old_classes)
+    removed_classes = sorted(old_classes - new_classes)
+    common_classes = sorted(old_classes & new_classes)
+
+    result = {
+        "old_apk": old_apk,
+        "new_apk": new_apk,
+        "summary": {
+            "old_class_count": len(old_classes),
+            "new_class_count": len(new_classes),
+            "added_classes": len(added_classes),
+            "removed_classes": len(removed_classes),
+            "common_classes": len(common_classes),
+        },
+        "added_classes": [_dalvik_to_dot(c) for c in added_classes[:limit]],
+        "removed_classes": [_dalvik_to_dot(c) for c in removed_classes[:limit]],
+    }
+
+    if level == 1:
+        return result
+
+    # --- Level 2: method diff per common class ---
+    old_methods = _collect_all_methods(old_apk)
+    new_methods = _collect_all_methods(new_apk)
+
+    class_changes = []
+    total_added_methods = 0
+    total_removed_methods = 0
+    total_modified_methods = 0
+
+    for cls in common_classes:
+        old_sigs = old_methods.get(cls, set())
+        new_sigs = new_methods.get(cls, set())
+        added = sorted(new_sigs - old_sigs)
+        removed = sorted(old_sigs - new_sigs)
+        if not added and not removed:
+            continue
+        total_added_methods += len(added)
+        total_removed_methods += len(removed)
+        class_changes.append({
+            "class": _dalvik_to_dot(cls),
+            "added_methods": added,
+            "removed_methods": removed,
+        })
+
+    result["summary"]["added_methods"] = total_added_methods
+    result["summary"]["removed_methods"] = total_removed_methods
+    result["class_changes"] = class_changes[:limit]
+
+    if level == 2:
+        return result
+
+    # --- Level 3: bytecode hash diff + smali diff ---
+    def get_method_bytecode_hash(apk_path, dalvik_class, method_sig):
+        handler = ApkHandler(apk_path)
+        hit = handler.get_class_dex(dalvik_class)
+        if hit is None:
+            return None, None
+        _, d_buf = hit
+        dex = DEX.parse(memoryview(d_buf), "")
+        clazz = dex.get_class(dalvik_class)
+        if clazz is None:
+            return None, None
+        for m in clazz.methods:
+            sig = _format_method_sig(m, dex)
+            if sig == method_sig:
+                bc = m.bytecode
+                if not bc:
+                    return hashlib.sha256(b"").hexdigest(), dex
+                return hashlib.sha256(bytes(bc)).hexdigest(), dex
+        return None, None
+
+    def get_method_smali(apk_path, dalvik_class, method_name_target, method_sig):
+        handler = ApkHandler(apk_path)
+        hit = handler.get_class_dex(dalvik_class)
+        if hit is None:
+            return []
+        _, d_buf = hit
+        dex = DEX.parse(memoryview(d_buf), "")
+        clazz = dex.get_class(dalvik_class)
+        if clazz is None:
+            return []
+        for m in clazz.methods:
+            sig = _format_method_sig(m, dex)
+            if sig == method_sig:
+                return render_smali(m.bytecode, dex)
+        return []
+
+    modified_methods_total = 0
+    for change in class_changes:
+        cls = None
+        for c in common_classes:
+            if _dalvik_to_dot(c) == change["class"]:
+                cls = c
+                break
+        if cls is None:
+            continue
+
+        # Find methods present in both but potentially modified (not in added/removed)
+        old_sigs = old_methods.get(cls, set())
+        new_sigs = new_methods.get(cls, set())
+        shared = old_sigs & new_sigs
+
+        mods = []
+        for sig in sorted(shared):
+            old_hash, _ = get_method_bytecode_hash(old_apk, cls, sig)
+            new_hash, _ = get_method_bytecode_hash(new_apk, cls, sig)
+            if old_hash is None or new_hash is None:
+                continue
+            if old_hash == new_hash:
+                continue
+
+            method_name = sig.split("(")[0]
+            old_smali = get_method_smali(old_apk, cls, method_name, sig)
+            new_smali = get_method_smali(new_apk, cls, method_name, sig)
+            diff_lines = list(difflib.unified_diff(
+                old_smali, new_smali,
+                fromfile=f"old/{method_name}",
+                tofile=f"new/{method_name}",
+                lineterm="",
+            ))
+            if diff_lines:
+                mods.append({
+                    "signature": sig,
+                    "diff": "\n".join(diff_lines[:100]),
+                })
+
+        if mods:
+            modified_methods_total += len(mods)
+            change["modified_methods"] = mods
+
+    result["summary"]["modified_methods"] = modified_methods_total
+    return result
+
+
 _COMMAND_HANDLERS = {
     "manifest": handle_manifest,
     "list_classes": handle_list_classes,
@@ -971,6 +1391,9 @@ _COMMAND_HANDLERS = {
     "get_string_constants": handle_get_string_constants,
     "scan_secrets": handle_scan_secrets,
     "disassemble_method": handle_disassemble_method,
+    "get_certificate": handle_get_certificate,
+    "call_graph": handle_call_graph,
+    "apk_diff": handle_apk_diff,
 }
 
 

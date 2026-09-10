@@ -22,7 +22,7 @@ class TestAscMcpServer(unittest.TestCase):
         cls.server = server
 
     def test_01_tools_registration(self):
-        """Verify that exactly 13 expected tools are registered with valid schemas."""
+        """Verify that exactly 16 expected tools are registered with valid schemas."""
         tools_map = self.server._tool_manager._tools
         expected_tools = {
             "apk_get_manifest",
@@ -38,6 +38,9 @@ class TestAscMcpServer(unittest.TestCase):
             "apk_get_string_constants",
             "apk_scan_secrets",
             "apk_disassemble_method",
+            "apk_get_certificate",
+            "apk_call_graph",
+            "apk_diff",
         }
         self.assertEqual(set(tools_map.keys()), expected_tools)
         for tool_name in expected_tools:
