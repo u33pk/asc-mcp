@@ -577,6 +577,7 @@ def handle_findrefs(payload: dict) -> dict:
 
 def handle_list_resources(payload: dict) -> dict:
     import zipfile
+    import logging
 
     apk_path = payload["apk_path"]
     prefix = (payload.get("prefix") or "").strip()
@@ -625,6 +626,39 @@ def handle_list_resources(payload: dict) -> dict:
                     "category": category,
                 })
 
+    # G1 fix: When prefix matches res/values*, also list ARSC resource types
+    values_resources = []
+    want_values = not prefix or prefix.startswith("res/values")
+    if want_values and "resources.arsc" in zipfile.ZipFile(apk_path, "r").namelist():
+        logging.disable(logging.CRITICAL)
+        try:
+            from src.asc_client.manifest_handler import _quiet_loguru
+            _quiet_loguru()
+            from androguard.core.axml import ARSCParser
+            with zipfile.ZipFile(apk_path, "r") as zf:
+                arsc_data = zf.read("resources.arsc")
+            arsc = ARSCParser(arsc_data)
+            pkg = arsc.get_packages_names()[0]
+            type_configs = arsc.get_type_configs(pkg, None)
+            for i, res_type in enumerate(type_configs):
+                type_id = i + 1
+                base = 0x7F000000 | (type_id << 16)
+                count = 0
+                for entry_id in range(20000):
+                    if arsc.get_resource_xml_name(base | entry_id, pkg) is not None:
+                        count += 1
+                    elif count > 0:
+                        break
+                values_resources.append({
+                    "type": res_type,
+                    "path": f"res/values ({res_type})",
+                    "count": count,
+                    "resource_id_base": f"0x{base:08X}",
+                })
+        except Exception:
+            pass
+        logging.disable(logging.NOTSET)
+
     total = sum(summary.values())
     return {
         "apk_path": apk_path,
@@ -634,6 +668,7 @@ def handle_list_resources(payload: dict) -> dict:
         "files_count": len(files),
         "truncated": len(files) < total,
         "files": files,
+        "values_resources": values_resources,
     }
 
 
@@ -1400,11 +1435,14 @@ def handle_apk_diff(payload: dict) -> dict:
 
 
 def handle_get_resource_content(payload: dict) -> dict:
+    import re
     import zipfile
+    import logging
     from src.asc_client.manifest_handler import _quiet_loguru
 
     apk_path = payload["apk_path"]
     resource_path = payload["resource_path"]
+    resolve_ids = payload.get("resolve_ids", True)
 
     if not os.path.isfile(apk_path):
         raise FileNotFoundError(f"APK file not found: {apk_path}")
@@ -1414,6 +1452,45 @@ def handle_get_resource_content(payload: dict) -> dict:
         if resource_path not in names:
             raise ValueError(f"Resource not found: {resource_path}. Use apk_list_resources to browse available files.")
         data = zf.read(resource_path)
+
+    def _build_id_map(apk_path):
+        """Build resource ID -> '@type/name' mapping from resources.arsc."""
+        id_map = {}
+        try:
+            with zipfile.ZipFile(apk_path, "r") as zf:
+                if "resources.arsc" not in zf.namelist():
+                    return id_map
+                arsc_data = zf.read("resources.arsc")
+            logging.disable(logging.CRITICAL)
+            _quiet_loguru()
+            from androguard.core.axml import ARSCParser
+            arsc = ARSCParser(arsc_data)
+            pkg = arsc.get_packages_names()[0]
+            type_configs = arsc.get_type_configs(pkg, None)
+            for i, res_type in enumerate(type_configs):
+                type_id = i + 1
+                base = 0x7F000000 | (type_id << 16)
+                for entry_id in range(20000):
+                    rid = base | entry_id
+                    name = arsc.get_resource_xml_name(rid, pkg)
+                    if name is not None:
+                        id_map[rid] = name
+                    elif entry_id > 0 and rid in id_map:
+                        continue
+                    elif entry_id > 0:
+                        break
+            logging.disable(logging.NOTSET)
+        except Exception:
+            logging.disable(logging.NOTSET)
+        return id_map
+
+    def _resolve_hex_ids(xml_text, id_map):
+        """Replace @7F... and @0x7F... hex IDs with @type/name in XML text."""
+        hex_re = re.compile(r'@(?:0x)?(7[fF][0-9a-fA-F]{6})\b')
+        def replacer(m):
+            hex_val = int(m.group(1), 16)
+            return id_map.get(hex_val, m.group(0))
+        return hex_re.sub(replacer, xml_text)
 
     # Binary XML detection: RES_XML_TYPE magic = 0x0003
     if data[:2] == b"\x03\x00":
@@ -1430,6 +1507,10 @@ def handle_get_resource_content(payload: dict) -> dict:
                 "raw_size": len(data),
             }
         xml_text = axml.get_xml(pretty=True).decode("utf-8", errors="replace")
+        if resolve_ids:
+            id_map = _build_id_map(apk_path)
+            if id_map:
+                xml_text = _resolve_hex_ids(xml_text, id_map)
         return {
             "apk_path": apk_path,
             "resource_path": resource_path,

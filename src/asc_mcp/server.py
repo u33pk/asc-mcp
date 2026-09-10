@@ -508,20 +508,24 @@ def apk_diff(
 def apk_get_resource_content(
     apk_path: str,
     resource_path: str,
+    resolve_ids: bool = True,
 ) -> dict:
     """Decode a resource file from an APK into readable content.
     Automatically detects binary XML (layouts, menus, animations) and decodes to readable XML.
+    Hex resource IDs (e.g. @0x7F08009A) are automatically resolved to human-readable names
+    (e.g. @id/call_avatar) using the ARSC resource table.
     Plain text files are returned as-is. Binary files are returned as base64.
     Use apk_list_resources first to discover available resource paths.
 
     Args:
         apk_path: Path to the target APK file.
         resource_path: Resource path within the APK (e.g. 'res/layout/activity_main.xml').
+        resolve_ids: If true (default), resolve hex resource IDs to @type/name format.
     """
     try:
         return _invoke_worker(
             "get_resource_content",
-            {"apk_path": apk_path, "resource_path": resource_path},
+            {"apk_path": apk_path, "resource_path": resource_path, "resolve_ids": resolve_ids},
         )
     except Exception as e:
         return {"status": "error", "error": str(e), "apk_path": apk_path, "resource_path": resource_path}
