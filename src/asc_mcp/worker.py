@@ -1399,6 +1399,288 @@ def handle_apk_diff(payload: dict) -> dict:
     return result
 
 
+def handle_get_resource_content(payload: dict) -> dict:
+    import zipfile
+    from src.asc_client.manifest_handler import _quiet_loguru
+
+    apk_path = payload["apk_path"]
+    resource_path = payload["resource_path"]
+
+    if not os.path.isfile(apk_path):
+        raise FileNotFoundError(f"APK file not found: {apk_path}")
+
+    with zipfile.ZipFile(apk_path, "r") as zf:
+        names = zf.namelist()
+        if resource_path not in names:
+            raise ValueError(f"Resource not found: {resource_path}. Use apk_list_resources to browse available files.")
+        data = zf.read(resource_path)
+
+    # Binary XML detection: RES_XML_TYPE magic = 0x0003
+    if data[:2] == b"\x03\x00":
+        _quiet_loguru()
+        from androguard.core.axml import AXMLPrinter
+        _quiet_loguru()
+        axml = AXMLPrinter(data)
+        if not axml.is_valid():
+            return {
+                "apk_path": apk_path,
+                "resource_path": resource_path,
+                "format": "binary_xml_invalid",
+                "content": None,
+                "raw_size": len(data),
+            }
+        xml_text = axml.get_xml(pretty=True).decode("utf-8", errors="replace")
+        return {
+            "apk_path": apk_path,
+            "resource_path": resource_path,
+            "format": "binary_xml",
+            "content": xml_text,
+            "raw_size": len(data),
+        }
+
+    # Plain text (UTF-8)
+    try:
+        text = data.decode("utf-8")
+        return {
+            "apk_path": apk_path,
+            "resource_path": resource_path,
+            "format": "text",
+            "content": text,
+            "raw_size": len(data),
+        }
+    except UnicodeDecodeError:
+        import base64
+        return {
+            "apk_path": apk_path,
+            "resource_path": resource_path,
+            "format": "binary",
+            "content": None,
+            "base64": base64.b64encode(data).decode("ascii"),
+            "raw_size": len(data),
+        }
+
+
+def handle_class_hierarchy(payload: dict) -> dict:
+    import mmap as mmap_mod
+    import struct as struct_mod
+    from src.asc_client.apk_handler import ApkHandler, _parse_cd_dex_entries, _inflate_dex
+    from src.asc_client.dex_container import iter_logical_dex_buffers
+    from src.asc_core.utils.tinydex import DEX
+
+    apk_path = payload["apk_path"]
+    class_name = payload["class_name"]
+    dalvik_class = _format_class_name(class_name)
+
+    if not os.path.isfile(apk_path):
+        raise FileNotFoundError(f"APK file not found: {apk_path}")
+
+    _U32 = struct_mod.Struct("<I")
+
+    handler = ApkHandler(apk_path)
+    hit = handler.get_class_dex(dalvik_class)
+    if hit is None:
+        raise ValueError(f"Class {dalvik_class} not found in APK: {apk_path}")
+
+    dex_name, dex_buf = hit
+    dex = DEX.parse(memoryview(dex_buf), dex_name)
+
+    # --- Superclass chain (walk UP) ---
+    superclass_chain = []
+    interfaces = []
+    current = dalvik_class
+    visited_up = set()
+    for _ in range(20):
+        if current in visited_up:
+            break
+        visited_up.add(current)
+        clazz = dex.get_class(current)
+        if clazz is None:
+            superclass_chain.append(f"{_dalvik_to_dot(current)} (not in APK)")
+            break
+        class_def_off = clazz._class_def_off
+        super_idx = _U32.unpack_from(dex.buf, class_def_off + 8)[0]
+        if super_idx == 0xFFFFFFFF:
+            break
+        super_desc = dex.get_type(super_idx).descriptor
+        superclass_chain.append(_dalvik_to_dot(super_desc))
+        current = super_desc
+
+    # Target class interfaces
+    clazz = dex.get_class(dalvik_class)
+    if clazz is not None:
+        class_def_off = clazz._class_def_off
+        ifaces_off = _U32.unpack_from(dex.buf, class_def_off + 12)[0]
+        if ifaces_off > 0:
+            ifs_size = _U32.unpack_from(dex.buf, ifaces_off)[0]
+            off = ifaces_off + 4
+            for _ in range(ifs_size):
+                type_idx = struct_mod.unpack_from("<H", dex.buf, off)[0]
+                off += 2
+                interfaces.append(_dalvik_to_dot(dex.get_type(type_idx).descriptor))
+
+    # --- Subclasses + interface implementors (scan DOWN) ---
+    subclasses = []
+    implementors = []
+    is_interface = bool(interfaces) and clazz is not None
+
+    target_super_key = dalvik_class
+    target_iface_key = dalvik_class
+
+    with open(apk_path, "rb") as fp:
+        with mmap_mod.mmap(fp.fileno(), 0, access=mmap_mod.ACCESS_READ) as mm:
+            entries = _parse_cd_dex_entries(mm)
+            for entry in entries:
+                data = _inflate_dex(mm, entry)
+                if data is None:
+                    continue
+                for d_name, d_buf in iter_logical_dex_buffers(entry[0], data):
+                    d = DEX.parse(memoryview(d_buf), d_name)
+                    num_classes = len(d.classes)
+                    for i in range(num_classes):
+                        c = d.classes[i]
+                        c_off = c._class_def_off
+                        c_fullname = c.fullname
+                        if c_fullname == dalvik_class:
+                            continue
+
+                        # Check superclass
+                        s_idx = _U32.unpack_from(d.buf, c_off + 8)[0]
+                        if s_idx != 0xFFFFFFFF:
+                            s_desc = d.get_type(s_idx).descriptor
+                            if s_desc == target_super_key:
+                                subclasses.append(_dalvik_to_dot(c_fullname))
+
+                        # Check interfaces
+                        if_off = _U32.unpack_from(d.buf, c_off + 12)[0]
+                        if if_off > 0:
+                            if_size = _U32.unpack_from(d.buf, if_off)[0]
+                            ptr = if_off + 4
+                            for _ in range(if_size):
+                                t_idx = struct_mod.unpack_from("<H", d.buf, ptr)[0]
+                                ptr += 2
+                                if d.get_type(t_idx).descriptor == target_iface_key:
+                                    implementors.append(_dalvik_to_dot(c_fullname))
+                                    break
+
+    return {
+        "apk_path": apk_path,
+        "class_name": _dalvik_to_dot(dalvik_class),
+        "dalvik_class": dalvik_class,
+        "superclass_chain": superclass_chain,
+        "interfaces": interfaces,
+        "subclasses_count": len(subclasses),
+        "subclasses": subclasses,
+        "interface_implementors_count": len(implementors),
+        "interface_implementors": implementors if is_interface else [],
+    }
+
+
+def handle_search_in_methods(payload: dict) -> dict:
+    import mmap as mmap_mod
+    import re as re_mod
+    from src.asc_client.apk_handler import _parse_cd_dex_entries, _inflate_dex
+    from src.asc_client.dex_container import iter_logical_dex_buffers
+    from src.asc_core.utils.tinydex import DEX
+    from models.dvm_opcode import opcodes as _opcodes, IndexFlag
+
+    apk_path = payload["apk_path"]
+    pattern = (payload.get("pattern") or "").strip()
+    limit = max(1, min(int(payload.get("limit", 50)), 200))
+
+    if not os.path.isfile(apk_path):
+        raise FileNotFoundError(f"APK file not found: {apk_path}")
+    if not pattern:
+        raise ValueError("'pattern' must be provided.")
+
+    try:
+        compiled_re = re_mod.compile(pattern)
+    except re_mod.error as e:
+        raise ValueError(f"Invalid regex pattern: {e}")
+
+    results = []
+    seen = set()
+
+    with open(apk_path, "rb") as fp:
+        with mmap_mod.mmap(fp.fileno(), 0, access=mmap_mod.ACCESS_READ) as mm:
+            entries = _parse_cd_dex_entries(mm)
+            for entry in entries:
+                data = _inflate_dex(mm, entry)
+                if data is None:
+                    continue
+                for dex_name, dex_buf in iter_logical_dex_buffers(entry[0], data):
+                    dex = DEX.parse(memoryview(dex_buf), dex_name)
+                    num_strings = len(dex.strings)
+
+                    # Pre-filter: find string indices matching pattern
+                    matching_idxs = set()
+                    for idx in range(num_strings):
+                        try:
+                            val = dex.strings[idx]
+                        except (IndexError, KeyError):
+                            continue
+                        if compiled_re.search(val):
+                            matching_idxs.add(idx)
+
+                    if not matching_idxs:
+                        continue
+
+                    # Scan all methods for const-string opcodes referencing matching indices
+                    num_classes = len(dex.classes)
+                    for i in range(num_classes):
+                        clazz = dex.classes[i]
+                        cls_name = clazz.fullname
+                        for method in clazz.methods:
+                            bc = method.bytecode
+                            if not bc:
+                                continue
+                            bc_len = len(bc)
+                            method_matches = []
+                            pc = 0
+                            while pc < bc_len:
+                                opcode = bc[pc]
+                                if opcode not in _opcodes:
+                                    break
+                                op = _opcodes[opcode]
+                                if op.idx and op.idx.name == "kIndexStringRef":
+                                    idx_off = pc + 2
+                                    if op.fmt.name == "k31c":
+                                        if idx_off + 4 <= bc_len:
+                                            idx = bc[idx_off] | (bc[idx_off + 1] << 8) | (bc[idx_off + 2] << 16) | (bc[idx_off + 3] << 24)
+                                        else:
+                                            pc += op.oplen * 2
+                                            continue
+                                    else:
+                                        if idx_off + 2 <= bc_len:
+                                            idx = bc[idx_off] | (bc[idx_off + 1] << 8)
+                                        else:
+                                            pc += op.oplen * 2
+                                            continue
+                                    if idx in matching_idxs:
+                                        val = dex.strings[idx]
+                                        key = (_dalvik_to_dot(cls_name), method.name, val)
+                                        if key not in seen:
+                                            seen.add(key)
+                                            method_matches.append(val)
+                                pc += op.oplen * 2
+
+                            for val in method_matches:
+                                results.append({
+                                    "class": _dalvik_to_dot(cls_name),
+                                    "method": method.name,
+                                    "matched_string": val,
+                                    "dex": dex_name,
+                                })
+
+    total = len(results)
+    return {
+        "apk_path": apk_path,
+        "pattern": pattern,
+        "total_matches": total,
+        "truncated": total > limit,
+        "results": results[:limit],
+    }
+
+
 _COMMAND_HANDLERS = {
     "manifest": handle_manifest,
     "list_classes": handle_list_classes,
@@ -1416,6 +1698,9 @@ _COMMAND_HANDLERS = {
     "get_certificate": handle_get_certificate,
     "call_graph": handle_call_graph,
     "apk_diff": handle_apk_diff,
+    "get_resource_content": handle_get_resource_content,
+    "class_hierarchy": handle_class_hierarchy,
+    "search_in_methods": handle_search_in_methods,
 }
 
 

@@ -1,5 +1,5 @@
 """ASC (Droid ASC) Model Context Protocol (MCP) Server.
-Exposes 16 high-performance, token-efficient reverse engineering tools to LLMs.
+Exposes 19 high-performance, token-efficient reverse engineering tools to LLMs.
 """
 
 import json
@@ -502,6 +502,76 @@ def apk_diff(
         )
     except Exception as e:
         return {"status": "error", "error": str(e), "old_apk": old_apk, "new_apk": new_apk}
+
+
+@server.tool()
+def apk_get_resource_content(
+    apk_path: str,
+    resource_path: str,
+) -> dict:
+    """Decode a resource file from an APK into readable content.
+    Automatically detects binary XML (layouts, menus, animations) and decodes to readable XML.
+    Plain text files are returned as-is. Binary files are returned as base64.
+    Use apk_list_resources first to discover available resource paths.
+
+    Args:
+        apk_path: Path to the target APK file.
+        resource_path: Resource path within the APK (e.g. 'res/layout/activity_main.xml').
+    """
+    try:
+        return _invoke_worker(
+            "get_resource_content",
+            {"apk_path": apk_path, "resource_path": resource_path},
+        )
+    except Exception as e:
+        return {"status": "error", "error": str(e), "apk_path": apk_path, "resource_path": resource_path}
+
+
+@server.tool()
+def apk_get_class_hierarchy(
+    apk_path: str,
+    class_name: str,
+) -> dict:
+    """Get the class inheritance hierarchy: superclass chain, direct interfaces, subclasses,
+    and interface implementors. Answers 'who extends X' and 'who implements Y'.
+    Essential for understanding architecture of large Android projects.
+
+    Args:
+        apk_path: Path to the target APK file.
+        class_name: Class name in dot format (e.g. 'com.example.BaseController') or Dalvik format.
+    """
+    try:
+        return _invoke_worker(
+            "class_hierarchy",
+            {"apk_path": apk_path, "class_name": class_name},
+        )
+    except Exception as e:
+        return {"status": "error", "error": str(e), "apk_path": apk_path, "class_name": class_name}
+
+
+@server.tool()
+def apk_search_in_methods(
+    apk_path: str,
+    pattern: str,
+    limit: int = 50,
+) -> dict:
+    """Search for string patterns inside all method bodies across the entire APK.
+    Equivalent to JADX's global text search (Ctrl+Shift+F). Returns the class name,
+    method name, and matching string for each occurrence. Supports regex patterns.
+
+    Args:
+        apk_path: Path to the target APK file.
+        pattern: Regex pattern or substring to search for in method const-string instructions
+                 (e.g. 'api_key', 'https?://.*\\.example\\.com', 'AES').
+        limit: Maximum number of results to return (1-200, default 50).
+    """
+    try:
+        return _invoke_worker(
+            "search_in_methods",
+            {"apk_path": apk_path, "pattern": pattern, "limit": limit},
+        )
+    except Exception as e:
+        return {"status": "error", "error": str(e), "apk_path": apk_path, "pattern": pattern}
 
 
 def main():
