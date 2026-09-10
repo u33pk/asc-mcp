@@ -27,7 +27,7 @@ Configure in any MCP-compatible client (e.g. Claude Desktop, Kimi Code):
 }
 ```
 
-## Tools (16)
+## Tools (19)
 
 ### Core Analysis
 
@@ -39,6 +39,7 @@ Configure in any MCP-compatible client (e.g. Claude Desktop, Kimi Code):
 | `apk_get_class_source` | Full on-demand Java decompilation of a single class |
 | `apk_disassemble_method` | Disassemble a single method into smali bytecode |
 | `apk_call_graph` | Caller/callee call graph for a method (configurable depth 1-5) |
+| `apk_get_class_hierarchy` | Superclass chain, subclasses, and interface implementors |
 
 ### Search & Reference
 
@@ -48,6 +49,7 @@ Configure in any MCP-compatible client (e.g. Claude Desktop, Kimi Code):
 | `apk_list_methods` | Search methods by name across all DEX files (fuzzy match) |
 | `apk_search_strings` | Global regex search in the DEX string pool |
 | `apk_get_string_constants` | Extract all `const-string` values from a specific class |
+| `apk_search_in_methods` | Global regex search inside all method bodies (like JADX Ctrl+Shift+F) |
 
 ### Security & Signing
 
@@ -61,6 +63,7 @@ Configure in any MCP-compatible client (e.g. Claude Desktop, Kimi Code):
 | Tool | Description |
 |------|-------------|
 | `apk_list_resources` | List resource files with category breakdown (res/, assets/, lib/) |
+| `apk_get_resource_content` | Decode binary XML resources (layouts, menus, etc.) into readable XML |
 | `apk_list_native_libs` | List .so files by architecture (arm64-v8a, armeabi-v7a, etc.) |
 | `apk_extract_dex` | Export DEX files to disk for external tools (JADX, Ghidra, IDA) |
 
