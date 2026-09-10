@@ -6,6 +6,46 @@ import bisect
 _STRUCT_I = struct.Struct('<I')
 _STRUCT_H = struct.Struct('<H')
 _STRUCT_III = struct.Struct('<III')
+
+
+def _decode_mutf8(data: bytes) -> str:
+    """Decode Modified UTF-8 (MUTF-8/CESU-8) as used in DEX files."""
+    result = []
+    i = 0
+    length = len(data)
+    while i < length:
+        b0 = data[i]
+        if b0 == 0xC0 and i + 1 < length and data[i + 1] == 0x80:
+            result.append('\x00')
+            i += 2
+        elif b0 < 0x80:
+            result.append(chr(b0))
+            i += 1
+        elif (b0 & 0xE0) == 0xC0:
+            b1 = data[i + 1] & 0x3F
+            result.append(chr(((b0 & 0x1F) << 6) | b1))
+            i += 2
+        elif (b0 & 0xF0) == 0xE0:
+            b1 = data[i + 1] & 0x3F
+            b2 = data[i + 2] & 0x3F
+            cp = ((b0 & 0x0F) << 12) | (b1 << 6) | b2
+            if 0xD800 <= cp <= 0xDBFF and i + 5 < length:
+                b3 = data[i + 3]
+                if (b3 & 0xF0) == 0xE0:
+                    b4 = data[i + 4] & 0x3F
+                    b5 = data[i + 5] & 0x3F
+                    cp2 = ((b3 & 0x0F) << 12) | (b4 << 6) | b5
+                    if 0xDC00 <= cp2 <= 0xDFFF:
+                        full_cp = 0x10000 + ((cp - 0xD800) << 10) + (cp2 - 0xDC00)
+                        result.append(chr(full_cp))
+                        i += 6
+                        continue
+            result.append(chr(cp))
+            i += 3
+        else:
+            result.append('\ufffd')
+            i += 1
+    return ''.join(result)
 _STRUCT_HHI = struct.Struct('<HHI')
 _STRUCT_HHHHII = struct.Struct('<HHHHII')
 
@@ -348,12 +388,18 @@ class DEX:
             return self._strings[str_idx]
 
         str_idx_off = self.header.strings[0]
-        str_size = self.header.strings[1]
         string_off = _STRUCT_I.unpack_from(self.buf, str_idx_off + str_idx * 4)[0]
-        utf16_size, c = read_uleb128_fast(self.buf, string_off)
+        _, c = read_uleb128_fast(self.buf, string_off)
         data_start = string_off + c
-        end = data_start + utf16_size
-        s = bytes(self.buf[data_start:end]).decode('utf-8', errors='replace')
+
+        # Scan for null terminator (MUTF-8 null is 0xC0 0x80, but raw 0x00 also ends)
+        end = data_start
+        buf = self.buf
+        buf_len = len(buf)
+        while end < buf_len and buf[end] != 0:
+            end += 1
+
+        s = _decode_mutf8(bytes(buf[data_start:end]))
         self._strings[str_idx] = s
         return s
 

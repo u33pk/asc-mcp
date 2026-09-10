@@ -88,6 +88,11 @@ def build_find_query(find_type : str, value : str, class_name = None, fuzzy_clas
     if find_type == "type":
         return "type", {"type": value}
 
+    # Auto-fuzzy: unqualified class names (no package path) need fuzzy matching
+    if class_name and not fuzzy_class:
+        if "." not in class_name and "/" not in class_name and not (class_name.startswith("L") and class_name.endswith(";")):
+            fuzzy_class = True
+
     class_name = _normalize_class_query(class_name, fuzzy_class)
     if class_name is None and not value:
         raise ValueError(f"{find_type} query needs at least one of class or {find_type} name")

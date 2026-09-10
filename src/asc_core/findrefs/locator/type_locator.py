@@ -1,5 +1,6 @@
 from findrefs.locator.base_locator import BaseLocator
 from collections import defaultdict
+import re
 import struct
 import time
 
@@ -39,7 +40,7 @@ class TypeLocator(BaseLocator):
             self._debug_log("locate", t_start, 0)
             return set()
 
-        str_idxs = self.str_locator.locate(type_str)
+        str_idxs = self.str_locator.locate(re.escape(type_str))
         ret = set()
         type_maps = self.type_maps
         for str_idx in str_idxs:

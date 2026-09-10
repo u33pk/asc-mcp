@@ -861,6 +861,28 @@ def handle_scan_secrets(payload: dict) -> dict:
                                 "dex": dex_name,
                             })
 
+    # Also scan AndroidManifest.xml for secrets (API keys, etc.)
+    try:
+        import re as _re
+        from src.asc_client.manifest_handler import get_manifest_xml
+        manifest_xml = get_manifest_xml(apk_path)
+        for pattern_name, pattern_info in active_patterns.items():
+            for m in _re.finditer(pattern_info["pattern"], manifest_xml):
+                val = m.group(0)
+                key = (pattern_name, val)
+                if key in seen_values:
+                    continue
+                seen_values.add(key)
+                findings.append({
+                    "pattern": pattern_name,
+                    "severity": pattern_info["severity"],
+                    "description": pattern_info["description"],
+                    "value": val,
+                    "dex": "AndroidManifest.xml",
+                })
+    except Exception:
+        pass
+
     total = len(findings)
     severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
     findings.sort(key=lambda x: severity_order.get(x["severity"], 99))

@@ -359,7 +359,7 @@ def apk_get_string_constants(
 @server.tool()
 def apk_scan_secrets(
     apk_path: str,
-    patterns: Optional[list] = None,
+    patterns: Optional[list[str]] = None,
     limit: int = 100,
 ) -> dict:
     """Scan the entire DEX string pool for hardcoded secrets and sensitive patterns.
